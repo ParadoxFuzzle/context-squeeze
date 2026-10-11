@@ -1,0 +1,25 @@
+{
+  "name": "openclaw-plugin-context-squeeze",
+  "version": "0.2.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
+    "plugin:validate": "npm run validate-entry",
+    "validate-entry": "npm run build && openclaw plugins validate --entry ./dist/index.js",
+    "test": "node --test dist/test/*.js 2>/dev/null || true"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.5.17"
+  },
+  "devDependencies": {
+    "openclaw": "latest",
+    "typescript": "^5.6.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}

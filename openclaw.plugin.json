@@ -1,0 +1,48 @@
+{
+  "id": "context-squeeze",
+  "name": "Context Squeeze",
+  "description": "Hot/cold context compression with lossless anchors before LLM dispatch. Deterministic, no AI calls, per-request projection — on-disk transcripts stay lossless.",
+  "version": "0.2.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "keepRecentTurns": {
+        "type": "integer",
+        "default": 6
+      },
+      "compressionRatio": {
+        "type": "number",
+        "default": 0.3
+      },
+      "minTurnsBeforeCompression": {
+        "type": "integer",
+        "default": 10
+      },
+      "targetTokenBudget": {
+        "type": "integer",
+        "default": 0
+      },
+      "anchorPreserve": {
+        "type": "boolean",
+        "default": true
+      },
+      "minMessageChars": {
+        "type": "integer",
+        "default": 400
+      },
+      "debugStatsFile": {
+        "type": "string",
+        "default": ""
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "context-squeeze-stats"
+    ]
+  }
+}
