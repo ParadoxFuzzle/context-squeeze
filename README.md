@@ -30,7 +30,7 @@ Then in `openclaw.json`:
         "config": {
           "keepRecentTurns": 6,
           "compressionRatio": 0.3,
-          "minTurnsBeforeCompression": 8
+          "minTurnsBeforeCompression": 10
         }
       }
     }
@@ -44,7 +44,7 @@ Then in `openclaw.json`:
 |---|---|---|
 | `keepRecentTurns` | 6 | turns kept verbatim (hot zone) |
 | `compressionRatio` | 0.3 | cold-zone target size (0.3 ≈ 30% of original) |
-| `minTurnsBeforeCompression` | 8 | don't compress sessions shorter than this |
+| `minTurnsBeforeCompression` | 10 | don't compress sessions shorter than this |
 | `targetTokenBudget` | 0 | >0 = squeeze cold zone to fit this token budget |
 | `anchorPreserve` | true | keep exact paths/commands/numbers/tickets in anchor lists |
 | `minMessageChars` | 400 | messages shorter stay verbatim even if cold |
