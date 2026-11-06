@@ -50,12 +50,12 @@ const baseEntry = defineToolPlugin({
       execute: async ({ sample, compressionRatio, targetTokenBudget }, config) => {
         const c = (config ?? {}) as Record<string, unknown>;
         const opts: CompressOptions = {
-          keepRecentTurns: num(c.keepRecentTurns, 6),
+          keepRecentTurns: clampInt(num(c.keepRecentTurns, 6), 1, 200),
           compressionRatio: clamp(num(compressionRatio ?? c.compressionRatio, 0.3), 0.05, 0.95),
-          minTurnsBeforeCompression: num(c.minTurnsBeforeCompression, 10),
-          targetTokenBudget: num(targetTokenBudget ?? c.targetTokenBudget, 0),
+          minTurnsBeforeCompression: clampInt(num(c.minTurnsBeforeCompression, 10), 2, 1000),
+          targetTokenBudget: clampInt(num(targetTokenBudget ?? c.targetTokenBudget, 0), 0, 2_000_000),
           anchorPreserve: c.anchorPreserve !== false,
-          minMessageChars: num(c.minMessageChars, 400),
+          minMessageChars: clampInt(num(c.minMessageChars, 400), 0, 8000),
         };
         const turns = parseSample(sample);
         if (turns.length < 2) {
@@ -102,4 +102,7 @@ function num(v: unknown, dflt: number): number {
 }
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+function clampInt(v: number, lo: number, hi: number): number {
+  return Math.round(clamp(v, lo, hi));
 }

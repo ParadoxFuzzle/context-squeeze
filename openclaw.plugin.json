@@ -1,8 +1,8 @@
 {
   "id": "context-squeeze",
   "name": "Context Squeeze",
-  "description": "Hot/cold context compression with lossless anchors before LLM dispatch. Deterministic, no AI calls, per-request projection — on-disk transcripts stay lossless.",
-  "version": "0.2.0",
+  "description": "Hot/cold context compression with lossless anchors before LLM dispatch. Deterministic, no AI calls, per-request projection \u2014 on-disk transcripts stay lossless.",
+  "version": "0.2.1",
   "configSchema": {
     "type": "object",
     "properties": {

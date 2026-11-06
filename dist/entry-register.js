@@ -1,12 +1,14 @@
 import { compressHistory, estimateTokens } from "./compress.js";
+import * as os from "node:os";
+import * as pathMod from "node:path";
 function mkOpts(cfg, ratioOverride, budgetOverride) {
     return {
-        keepRecentTurns: num(cfg.keepRecentTurns, 6),
+        keepRecentTurns: clampInt(num(cfg.keepRecentTurns, 6), 1, 200),
         compressionRatio: clamp(num(ratioOverride ?? cfg.compressionRatio, 0.3), 0.05, 0.95),
-        minTurnsBeforeCompression: num(cfg.minTurnsBeforeCompression, 10),
-        targetTokenBudget: num(budgetOverride ?? cfg.targetTokenBudget, 0),
+        minTurnsBeforeCompression: clampInt(num(cfg.minTurnsBeforeCompression, 10), 2, 1000),
+        targetTokenBudget: clampInt(num(budgetOverride ?? cfg.targetTokenBudget, 0), 0, 2_000_000),
         anchorPreserve: cfg.anchorPreserve !== false,
-        minMessageChars: num(cfg.minMessageChars, 400),
+        minMessageChars: clampInt(num(cfg.minMessageChars, 400), 0, 8000),
     };
 }
 function normalizeRole(role) {
@@ -73,15 +75,22 @@ export function withContextSqueezeHook(entry) {
             const prepend = runCompressionForMessages(messages, opts, api.logger);
             if (!prepend)
                 return;
-            const debugStatsFile = typeof cfg.debugStatsFile === "string" ? cfg.debugStatsFile : "";
+            const debugStatsFile = typeof cfg.debugStatsFile === "string" ? cfg.debugStatsFile.trim() : "";
             if (debugStatsFile) {
                 void (async () => {
                     try {
                         const fs = await import("node:fs");
-                        const path = await import("node:path");
+                        const target = expandHome(debugStatsFile);
+                        // Absolute paths only: a relative path would depend on the gateway's
+                        // cwd, and every turn appends a line (unbounded growth).
+                        if (!pathMod.isAbsolute(target))
+                            return;
+                        if (fs.existsSync(target) && fs.statSync(target).size > 5 * 1024 * 1024) {
+                            fs.truncateSync(target, 0);
+                        }
                         const stats = { ts: new Date().toISOString(), prependChars: prepend.length };
-                        fs.mkdirSync(path.dirname(debugStatsFile), { recursive: true });
-                        fs.appendFileSync(debugStatsFile, JSON.stringify(stats) + "\n");
+                        fs.mkdirSync(pathMod.dirname(target), { recursive: true });
+                        fs.appendFileSync(target, JSON.stringify(stats) + "\n");
                     }
                     catch {
                         /* best-effort debug logging */
@@ -90,8 +99,9 @@ export function withContextSqueezeHook(entry) {
             }
             return { prependContext: prepend };
         });
-        // Then let defineToolPlugin's original register add the tool(s).
-        userRegister(api);
+        // Then let defineToolPlugin's original register add the tool(s). Bind the
+        // entry: a bare call drops `this`, which the SDK's register() relies on.
+        userRegister.call(entry, api);
     };
     return entry;
 }
@@ -101,4 +111,14 @@ function num(v, dflt) {
 }
 function clamp(v, lo, hi) {
     return Math.max(lo, Math.min(hi, v));
+}
+function clampInt(v, lo, hi) {
+    return Math.round(clamp(v, lo, hi));
+}
+function expandHome(p) {
+    if (p === "~")
+        return os.homedir();
+    if (p.startsWith("~/"))
+        return pathMod.join(os.homedir(), p.slice(2));
+    return p;
 }

@@ -132,9 +132,14 @@ export function compressTurnText(text: string, budgetChars: number, anchorPreser
   const keptSentences = sentences.filter((_, i) => keep.has(i));
 
   let body = keptSentences.join(" ");
+  // Truncate the prose FIRST, then prepend the anchor block. Slicing the
+  // combined string (the old order) could cut off the exact paths/commands the
+  // plugin promises to preserve — the one thing compression must never lose.
+  const proseBudget = Math.max(0, budgetChars - anchorBlock.length - 1);
+  if (body.length > proseBudget) body = body.slice(0, Math.max(0, proseBudget - 1)).trimEnd() + "…";
   if (anchorBlock) body = body ? `${anchorBlock} ${body}` : anchorBlock;
-  // Hard guarantee on budget.
-  if (body.length > budgetChars) body = body.slice(0, Math.max(40, budgetChars - 1)) + "…";
+  // Last resort, only when the anchor list alone exceeds the budget.
+  if (body.length > budgetChars) body = body.slice(0, Math.max(40, budgetChars - 1)) + "…[anchors clipped]";
   return { compressed: body, anchors: anchors.length };
 }
 
