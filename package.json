@@ -1,31 +1,53 @@
 {
   "name": "context-squeeze",
-  "version": "0.2.2",
+  "version": "0.3.0",
+  "description": "Token-reducing OpenClaw context engine with deterministic hot/cold compression and best-effort anchors.",
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ParadoxFuzzle/context-squeeze.git"
+  },
+  "homepage": "https://github.com/ParadoxFuzzle/context-squeeze#readme",
+  "bugs": {
+    "url": "https://github.com/ParadoxFuzzle/context-squeeze/issues"
+  },
+  "engines": {
+    "node": ">=24.16.0"
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
+    "plugin:build": "npm run build",
     "plugin:validate": "npm run validate-entry",
-    "validate-entry": "npm run build && openclaw plugins validate --entry ./dist/index.js",
-    "test": "node --test dist/test/*.js 2>/dev/null || true"
+    "validate-entry": "npm run build && node scripts/validate-entry.mjs",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "check:dist": "git diff --exit-code -- dist"
   },
   "openclaw": {
     "extensions": [
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.5.17"
+      "pluginApi": ">=2026.11.1"
     },
     "build": {
-      "openclawVersion": "2026.9.9"
+      "openclawVersion": "2026.11.1"
     }
   },
+  "dependencies": {
+    "typebox": "^1.3.35"
+  },
   "peerDependencies": {
-    "openclaw": ">=2026.5.17"
+    "openclaw": ">=2026.11.1"
   },
   "devDependencies": {
-    "openclaw": "latest",
+    "openclaw": "2026.11.1",
     "typescript": "^5.6.0"
   }
 }

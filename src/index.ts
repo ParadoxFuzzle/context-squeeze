@@ -1,108 +1,98 @@
-// index.ts — Context Squeeze plugin entry.
+// index.ts — Context Squeeze OpenClaw plugin entry.
 //
-// Tool-plugin packaging (passes `openclaw plugins validate/build`) that both:
-//   1. registers a `before_prompt_build` hook projecting session history into
-//      hot (verbatim recent) + cold (anchor-preserving compressed) zones,
-//      injected via `prependContext` (see entry-register.ts); and
-//   2. exposes a `context-squeeze-stats` tool: a dry-run of the compressor so
-//      the owner can inspect exactly what would be kept, without touching a
-//      real session.
-//
-// The hook is a per-request projection — on-disk transcripts stay lossless.
-
-import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
+// Registers a real context engine (plugins.slots.contextEngine) that projects
+// old history into a smaller message array before each model call, plus a
+// dry-run tool for inspecting the compressor.
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { textResult } from "openclaw/plugin-sdk/tool-results";
-import { Type } from "typebox";
-import { compressHistory, estimateTokens, type CompressOptions, type Turn } from "./compress.js";
-import { withContextSqueezeHook } from "./entry-register.js";
+import { Type, type Static } from "typebox";
+import { compressHistory, estimateTokens, type Turn } from "./compress.js";
+import { configSchema, resolveConfig } from "./config.js";
+import { createContextSqueezeEngine } from "./context-engine.js";
 
-const baseEntry = defineToolPlugin({
+const StatsParams = Type.Object({
+  sample: Type.String({
+    description:
+      "Transcript text; separate turns with lines like 'user: ...' / 'assistant: ...' (or blank lines).",
+  }),
+  compressionRatio: Type.Optional(
+    Type.Number({ minimum: 0.05, maximum: 0.95, description: "Override ratio; default = plugin config." })
+  ),
+  targetTokenBudget: Type.Optional(
+    Type.Integer({ minimum: 0, maximum: 2_000_000, description: "Override token budget; 0 = ratio mode." })
+  ),
+});
+type StatsParams = Static<typeof StatsParams>;
+
+export default definePluginEntry({
   id: "context-squeeze",
   name: "Context Squeeze",
   description:
-    "Hot/cold context compression with lossless anchors before LLM dispatch. Deterministic, no AI calls, per-request projection — on-disk transcripts stay lossless.",
-  configSchema: {
-    type: "object",
-    properties: {
-      keepRecentTurns: { type: "integer", default: 6 },
-      compressionRatio: { type: "number", default: 0.3 },
-      minTurnsBeforeCompression: { type: "integer", default: 10 },
-      targetTokenBudget: { type: "integer", default: 0 },
-      anchorPreserve: { type: "boolean", default: true },
-      minMessageChars: { type: "integer", default: 400 },
-      debugStatsFile: { type: "string", default: "" },
-    },
-    additionalProperties: false,
-  },
-  tools: (tool) => [
-    tool({
-      name: "context-squeeze-stats",
-      description:
-        "Dry-run the context-squeeze compressor on a sample transcript. Returns cold-zone stats, kept anchors, projected size. Modifies nothing.",
-      parameters: Type.Object({
-        sample: Type.String({
-          description:
-            "Transcript text; separate turns with lines like 'user: ...' / 'assistant: ...' (or blank lines).",
-        }),
-        compressionRatio: Type.Optional(Type.Number({ description: "Override ratio (0.05–0.95; default = plugin config)." })),
-        targetTokenBudget: Type.Optional(Type.Number({ description: "Override token budget (0 = ratio mode)." })),
-      }),
-      execute: async ({ sample, compressionRatio, targetTokenBudget }, config) => {
-        const c = (config ?? {}) as Record<string, unknown>;
-        const opts: CompressOptions = {
-          keepRecentTurns: clampInt(num(c.keepRecentTurns, 6), 1, 200),
-          compressionRatio: clamp(num(compressionRatio ?? c.compressionRatio, 0.3), 0.05, 0.95),
-          minTurnsBeforeCompression: clampInt(num(c.minTurnsBeforeCompression, 10), 2, 1000),
-          targetTokenBudget: clampInt(num(targetTokenBudget ?? c.targetTokenBudget, 0), 0, 2_000_000),
-          anchorPreserve: c.anchorPreserve !== false,
-          minMessageChars: clampInt(num(c.minMessageChars, 400), 0, 8000),
-        };
-        const turns = parseSample(sample);
-        if (turns.length < 2) {
-          return textResult(
-            "Need at least 2 turns (lines like 'user: ...'). A single turn is never compressed — that's the honest answer, not an error.",
-            { ok: false }
-          );
-        }
-        const { projected, stats } = compressHistory(turns, opts);
-        const lines = [
-          `turns: ${stats.turnsTotal} (hot verbatim: ${turns.length - stats.turnsCompressed}, cold compressed: ${stats.turnsCompressed})`,
-          `chars: ${stats.charsBefore} → ${stats.charsAfter} (${stats.savingsPct}% saved ≈ ${estimateTokens(stats.charsBefore - stats.charsAfter)} tokens)`,
-          `anchors kept: ${stats.anchorsKept}`,
-          "",
-          "— projection preview —",
-        ];
-        for (const t of projected) {
-          lines.push((t.compressed ? "[COLD] " : "[HOT ] ") + t.text.split("\n")[0].slice(0, 160));
-        }
-        return textResult(lines.join("\n"), { ok: true, stats });
-      },
-    }),
-  ],
-});
+    "Token-reducing context engine: keeps recent messages verbatim and compresses older prose with best-effort anchors. Deterministic, no AI calls.",
+  configSchema,
+  register(api) {
+    const config = resolveConfig(api.pluginConfig);
+    api.logger.info(
+      `context-squeeze context engine ready: hot=${config.keepRecentTurns} messages, ` +
+        `ratio=${config.compressionRatio}, budget=${config.targetTokenBudget || "host"}, ` +
+        `anchors=${config.anchorPreserve}`
+    );
 
-export default withContextSqueezeHook(baseEntry as unknown as Parameters<typeof withContextSqueezeHook>[0]);
+    api.registerContextEngine("context-squeeze", () =>
+      createContextSqueezeEngine(config, api.logger)
+    );
+
+    api.registerTool(
+      {
+        name: "context-squeeze-stats",
+        label: "Context Squeeze Stats",
+        description:
+          "Dry-run the context-squeeze compressor on a sample transcript. Returns cold-zone stats, kept anchors, and projected size. Modifies nothing.",
+        parameters: StatsParams,
+        async execute(_toolCallId, rawParams) {
+          const params = rawParams as StatsParams;
+          const opts = resolveConfig(api.pluginConfig, {
+            compressionRatio: params.compressionRatio,
+            targetTokenBudget: params.targetTokenBudget,
+          });
+          const turns = parseSample(params.sample);
+          if (turns.length < 2) {
+            return textResult(
+              "Need at least 2 turns (lines like 'user: ...'). A single turn is never compressed.",
+              { ok: false }
+            );
+          }
+
+          const { projected, stats } = compressHistory(turns, opts);
+          const lines = [
+            `turns: ${stats.turnsTotal} (hot verbatim: ${stats.turnsTotal - stats.turnsCompressed - stats.turnsDropped}, compressed: ${stats.turnsCompressed}, dropped: ${stats.turnsDropped})`,
+            `chars: ${stats.charsBefore} → ${stats.charsAfter} (${stats.savingsPct}% saved ≈ ${estimateTokens(stats.charsBefore - stats.charsAfter)} tokens)`,
+            `anchors: ${stats.anchorsKept} kept, ${stats.anchorsClipped} clipped`,
+            `budget: ${stats.budgetChars === null ? "ratio mode" : `${stats.budgetChars} chars`}${stats.overBudget ? " (still over)" : ""}`,
+            "",
+            "— projection preview —",
+          ];
+          for (const turn of projected) {
+            const state = turn.compressed ? "[COLD]" : "[HOT ]";
+            lines.push(`${state} ${turn.text.split("\n")[0].slice(0, 160)}`);
+          }
+          return textResult(lines.join("\n"), { ok: true, stats });
+        },
+      },
+      { name: "context-squeeze-stats", workspaceAccess: false }
+    );
+  },
+});
 
 function parseSample(sample: string): Turn[] {
   const turns: Turn[] = [];
-  for (const rawline of sample.split(/\n\n+|\n(?=(?:user|assistant|tool|system):)/i)) {
-    const line = rawline.trim();
+  for (const rawLine of sample.split(/\n\n+|\n(?=(?:user|assistant|tool|system):)/i)) {
+    const line = rawLine.trim();
     if (!line) continue;
-    const m = line.match(/^(user|assistant|tool|system)\s*:\s*/i);
-    const role = (m ? m[1] : "user").toLowerCase() as Turn["role"];
-    const text = m ? line.slice(m[0].length) : line;
+    const match = line.match(/^(user|assistant|tool|system)\s*:\s*/i);
+    const role = (match ? match[1] : "user").toLowerCase() as Turn["role"];
+    const text = match ? line.slice(match[0].length) : line;
     turns.push({ role, text });
   }
   return turns;
-}
-
-function num(v: unknown, dflt: number): number {
-  const n = typeof v === "number" ? v : Number(v);
-  return Number.isFinite(n) ? n : dflt;
-}
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
-}
-function clampInt(v: number, lo: number, hi: number): number {
-  return Math.round(clamp(v, lo, hi));
 }

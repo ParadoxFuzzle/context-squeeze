@@ -1,38 +1,56 @@
 {
   "id": "context-squeeze",
   "name": "Context Squeeze",
-  "description": "Hot/cold context compression with lossless anchors before LLM dispatch. Deterministic, no AI calls, per-request projection \u2014 on-disk transcripts stay lossless.",
-  "version": "0.2.2",
+  "description": "Token-reducing OpenClaw context engine. Keeps recent messages verbatim, compresses older prose with best-effort anchors, and preserves system instructions and tool results. Deterministic, no AI calls.",
+  "version": "0.3.0",
+  "kind": "context-engine",
   "configSchema": {
     "type": "object",
     "properties": {
       "keepRecentTurns": {
         "type": "integer",
-        "default": 6
+        "minimum": 1,
+        "maximum": 200,
+        "default": 6,
+        "description": "Number of most recent messages kept verbatim."
       },
       "compressionRatio": {
         "type": "number",
-        "default": 0.3
+        "minimum": 0.05,
+        "maximum": 0.95,
+        "default": 0.3,
+        "description": "Target size of compressed cold messages as a fraction of their original size."
       },
       "minTurnsBeforeCompression": {
         "type": "integer",
-        "default": 10
+        "minimum": 2,
+        "maximum": 1000,
+        "default": 10,
+        "description": "Do not compress histories shorter than this many messages."
       },
       "targetTokenBudget": {
         "type": "integer",
-        "default": 0
+        "minimum": 0,
+        "maximum": 2000000,
+        "default": 0,
+        "description": "Additional hard prompt budget in tokens. 0 uses the host budget only."
       },
       "anchorPreserve": {
         "type": "boolean",
-        "default": true
+        "default": true,
+        "description": "Preserve paths, commands, addresses, ticket ids, and similar facts as anchors."
       },
       "minMessageChars": {
         "type": "integer",
-        "default": 400
+        "minimum": 0,
+        "maximum": 8000,
+        "default": 400,
+        "description": "Cold messages shorter than this stay verbatim."
       },
       "debugStatsFile": {
         "type": "string",
-        "default": ""
+        "default": "",
+        "description": "Optional absolute path for append-only JSONL compression stats."
       }
     },
     "additionalProperties": false

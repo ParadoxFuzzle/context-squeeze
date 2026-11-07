@@ -1,40 +1,61 @@
-// compress.ts — core hot/cold context compression with lossless anchors.
+// compress.ts — deterministic hot/cold context compression.
 //
-// Design principles (vs. plain extractive turboquant):
-// 1. ANCHOR PRESERVATION: exact strings that a future turn may need verbatim
-//    (file paths, commands, URLs, numbers, error codes, quoted identifiers)
-//    survive compression as a compact anchor list per turn. Compression must
-//    never lose a fact that aggregation would need — it loses prose redundancy.
-// 2. SPEAKER/TIME STRUCTURE: every cold turn is tagged [tN user]/[tN assistant]
-//    so temporal ordering and attribution survive compression.
-// 3. PRIORITIZED EXTRACTION: sentences scored by (anchor density + position +
-//    decision/commit markers + question markers), not just term frequency.
-// 4. TOKEN BUDGET MODE: if targetTokenBudget > 0, compress the cold zone to
-//    FIT the budget (iterative ratio), instead of a fixed ratio.
-// 5. NO AI CALLS: deterministic, fast, free — same spirit as turboquant.
+// The compressor keeps recent messages verbatim, compresses older prose with
+// priority-weighted sentence extraction, and preserves exact facts (paths,
+// commands, addresses, ticket ids) as best-effort anchor lists.
+//
+// It never compresses system instructions, tool results, or messages carrying
+// non-text content. The caller decides those boundaries; this module only
+// compresses Turn objects marked as compressible.
+//
+// Budget accounting uses an approximate message overhead so a token budget is a
+// real upper bound on the projected payload, not just a per-message suggestion.
+
+export type TurnRole = "user" | "assistant" | "system" | "tool" | "other";
 
 export interface CompressOptions {
-  keepRecentTurns: number;       // hot zone size (verbatim)
-  compressionRatio: number;      // cold zone target (0.3 = ~30% of original)
+  keepRecentTurns: number;
+  compressionRatio: number;
   minTurnsBeforeCompression: number;
-  targetTokenBudget: number;     // 0 = use ratio mode; >0 = budget mode
+  targetTokenBudget: number;
+  /** Host-provided prompt budget for this run, in tokens. */
+  hostTokenBudget?: number;
   anchorPreserve: boolean;
-  minMessageChars: number;       // messages shorter than this stay verbatim in cold zone
+  minMessageChars: number;
 }
 
 export interface Turn {
-  role: "user" | "assistant" | "system" | "tool";
+  role: TurnRole;
   text: string;
+  /** Overrides the default user/assistant eligibility. */
+  compressible?: boolean;
 }
 
 export interface CompressStats {
   turnsTotal: number;
   turnsCompressed: number;
+  turnsDropped: number;
   charsBefore: number;
   charsAfter: number;
   anchorsKept: number;
+  anchorsClipped: number;
   savingsPct: number;
+  budgetChars: number | null;
+  overBudget: boolean;
 }
+
+export interface ProjectedTurn {
+  role: TurnRole;
+  text: string;
+  compressed: boolean;
+  originalIndex: number;
+  anchors: number;
+}
+
+const MESSAGE_OVERHEAD_CHARS = 8;
+const MIN_SOURCE_CHARS = 40;
+const MIN_TEXT_CHARS = 8;
+const TAG_ROLE_FALLBACK = "other";
 
 // ---- Anchor extraction ------------------------------------------------------
 
@@ -42,12 +63,12 @@ const ANCHOR_PATTERNS: Array<{ re: RegExp; kind: string }> = [
   { re: /(?:^|\s)(?:\/(?:[\w.@+-]+\/)*[\w.@+-]+\.[a-z]{1,6})(?=\s|$|[,)\]])/gi, kind: "path" },
   { re: /(?:^|\s)(?:~\/(?:[\w.@+-]+\/)*[\w.@+-]+)/gi, kind: "path" },
   { re: /\b[a-z][\w-]*\.(?:js|ts|py|json|md|sh|yaml|yml|html|css|php|toml|conf)\b/gi, kind: "file" },
-  { re: /(?:https?:\/\/|www\.)[^\s)>\]]+/gi, kind: "url" },
+  { re: /(?:https?:\/\/|www\.)[^\s)>\\]]+/gi, kind: "url" },
   { re: /\b(?:localhost:\d+|127\.0\.0\.1:\d+|192\.168\.\d+\.\d+(?::\d+)?|10\.\d+\.\d+\.\d+(?::\d+)?)\b/g, kind: "addr" },
   { re: /(?:`[^`\n]{3,90}`)/g, kind: "code" },
   { re: /\b(?:npm|yarn|pnpm|pip|apt|systemctl|docker|git|curl|ssh|sudo|make|cargo|python3?|node)\s+[^\n;]{4,90}/gi, kind: "cmd" },
   { re: /\b\d+(?:\.\d+)?\s?(?:GB|MB|KB|tb|ms|s\b|min|tokens?|tok\/s|%)/gi, kind: "metric" },
-  { re: /\b[A-Z]{2,8}-\d{1,6}\b/g, kind: "ticket" },   // TICKET-123 / AB-123 style refs
+  { re: /\b[A-Z]{2,8}-\d{1,6}\b/g, kind: "ticket" },
   { re: /\b(?:port|pin|key|token|id|version|v)\s*[=:]\s*"?\S{1,40}/gi, kind: "kv" },
   { re: /\b[a-f0-9]{7,64}\b/g, kind: "hash" },
   { re: /\b[A-Z][A-Z0-9_]{2,28}\b/g, kind: "const" },
@@ -56,11 +77,11 @@ const ANCHOR_PATTERNS: Array<{ re: RegExp; kind: string }> = [
 export function extractAnchors(text: string, cap = 24): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const { re, kind } of ANCHOR_PATTERNS) {
+  for (const { re } of ANCHOR_PATTERNS) {
     re.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      const raw = m[0].trim().replace(/^[`"'(]+|[`"')]+$/g, "");
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(text)) !== null) {
+      const raw = match[0].trim().replace(/^[`"'(]+|[`"')]+$/g, "");
       if (!raw || raw.length < 3 || raw.length > 110) continue;
       const dedup = raw.toLowerCase();
       if (seen.has(dedup)) continue;
@@ -82,125 +103,268 @@ function splitSentences(text: string): string[] {
   return text
     .replace(/\s+/g, " ")
     .split(/(?<=[.!?])\s+(?=[A-Z0-9`\w])/)
-    .map(s => s.trim())
-    .filter(s => s.length > 0);
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0);
 }
 
-function scoreSentence(s: string, position: number, total: number): number {
+function scoreSentence(sentence: string, position: number, total: number): number {
   let score = 0;
-  if (DECISION_RE.test(s)) score += 3;
-  if (QUESTION_RE.test(s)) score += 2;
-  if (s.length > 40 && s.length < 320) score += 1;
-  const anchors = extractAnchors(s, 6);
-  score += Math.min(3, anchors.length * 0.75);
-  // First sentences of a turn often carry intent ("Can you fix…").
+  if (DECISION_RE.test(sentence)) score += 3;
+  if (QUESTION_RE.test(sentence)) score += 2;
+  if (sentence.length > 40 && sentence.length < 320) score += 1;
+  score += Math.min(3, extractAnchors(sentence, 6).length * 0.75);
   if (position === 0) score += 1.5;
   else if (position / Math.max(1, total) > 0.8) score += 0.5;
-  // Pronoun-only openers have little standalone value.
-  if (PRONOUN_HEAVY_RE.test(s) && score < 2) score -= 1.5;
+  if (PRONOUN_HEAVY_RE.test(sentence) && score < 2) score -= 1.5;
   return score;
 }
 
-// ---- Per-turn compression ---------------------------------------------------
+// ---- Per-message compression ------------------------------------------------
 
-export function compressTurnText(text: string, budgetChars: number, anchorPreserve: boolean): {
-  compressed: string; anchors: number;
-} {
-  const sentences = splitSentences(text);
-  if (sentences.length === 0) return { compressed: text.slice(0, Math.max(40, budgetChars)), anchors: 0 };
-
-  const scored = sentences
-    .map((s, i) => ({ s, i, score: scoreSentence(s, i, sentences.length) }))
-    .sort((a, b) => b.score - a.score);
-
-  const anchors = anchorPreserve ? extractAnchors(text) : [];
-  const anchorBlock = anchors.length
-    ? `[anchors: ${anchors.map(a => (a.includes("`") ? a : `\`${a}\``)).join(" · ")}]`
-    : "";
-
-  // Greedy fill: highest-scored sentences first, but reassemble in original order.
-  const keep = new Set<number>();
-  let used = anchorBlock.length + 4;
-  for (const { s, i } of scored) {
-    const cost = s.length + 1;
-    if (used + cost <= budgetChars || keep.size === 0) {
-      keep.add(i);
-      used += cost;
-    }
-    if (used >= budgetChars) break;
-  }
-  const keptSentences = sentences.filter((_, i) => keep.has(i));
-
-  let body = keptSentences.join(" ");
-  // Truncate the prose FIRST, then prepend the anchor block. Slicing the
-  // combined string (the old order) could cut off the exact paths/commands the
-  // plugin promises to preserve — the one thing compression must never lose.
-  const proseBudget = Math.max(0, budgetChars - anchorBlock.length - 1);
-  if (body.length > proseBudget) body = body.slice(0, Math.max(0, proseBudget - 1)).trimEnd() + "…";
-  if (anchorBlock) body = body ? `${anchorBlock} ${body}` : anchorBlock;
-  // Last resort, only when the anchor list alone exceeds the budget.
-  if (body.length > budgetChars) body = body.slice(0, Math.max(40, budgetChars - 1)) + "…[anchors clipped]";
-  return { compressed: body, anchors: anchors.length };
+export interface CompressedText {
+  compressed: string;
+  anchors: number;
+  anchorsClipped: number;
 }
 
-// ---- Token estimate (chars/4 heuristic, no tiktoken dependency) --------------
+export function compressTurnText(text: string, budgetChars: number, anchorPreserve: boolean): CompressedText {
+  const budget = Math.max(0, Math.floor(budgetChars));
+  if (budget === 0) return { compressed: "", anchors: 0, anchorsClipped: 0 };
+
+  const anchors = anchorPreserve ? extractAnchors(text) : [];
+  const anchorCap = Math.min(budget, Math.floor(budget * 0.6));
+  const anchorBlock = buildAnchorBlock(anchors, anchorCap);
+  const anchorsKept = anchorBlock ? countAnchorBlockItems(anchorBlock) : 0;
+  const anchorsClipped = Math.max(0, anchors.length - anchorsKept);
+
+  const proseBudget = Math.max(0, budget - (anchorBlock ? anchorBlock.length + 1 : 0));
+  const sentences = splitSentences(text);
+  if (sentences.length === 0 || proseBudget === 0) {
+    return { compressed: anchorBlock || clip(text, budget), anchors: anchorsKept, anchorsClipped };
+  }
+
+  const scored = sentences
+    .map((sentence, index) => ({
+      sentence,
+      index,
+      score: scoreSentence(sentence, index, sentences.length),
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  // Greedy fill: highest-scored sentences first, then reassemble in original order.
+  const keep = new Set<number>();
+  let used = 0;
+  for (const { sentence, index } of scored) {
+    const cost = sentence.length + 1;
+    if (used + cost <= proseBudget || keep.size === 0) {
+      keep.add(index);
+      used += cost;
+    }
+    if (used >= proseBudget) break;
+  }
+
+  let body = sentences.filter((_, index) => keep.has(index)).join(" ");
+  body = clip(body, proseBudget);
+  const compressed = anchorBlock ? (body ? `${anchorBlock} ${body}` : anchorBlock) : body;
+  return {
+    compressed: compressed.length <= budget ? compressed : clip(compressed, budget),
+    anchors: anchorsKept,
+    anchorsClipped,
+  };
+}
+
+function buildAnchorBlock(anchors: string[], cap: number): string {
+  if (anchors.length === 0 || cap < 12) return "";
+  const prefix = "[anchors: ";
+  const suffix = "]";
+  const chosen: string[] = [];
+  for (const anchor of anchors) {
+    const formatted = anchor.includes("`") ? anchor : `\`${anchor}\``;
+    const candidate = `${prefix}${[...chosen, formatted].join(" · ")}${suffix}`;
+    if (candidate.length > cap) break;
+    chosen.push(formatted);
+  }
+  return chosen.length > 0 ? `${prefix}${chosen.join(" · ")}${suffix}` : "";
+}
+
+function countAnchorBlockItems(block: string): number {
+  return block.slice("[anchors: ".length, -1).split(" · ").filter(Boolean).length;
+}
+
+function clip(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  if (limit <= 0) return "";
+  if (limit === 1) return "…";
+  return text.slice(0, limit - 1).trimEnd() + "…";
+}
+
+// ---- Token estimate (chars/4 heuristic, no tokenizer dependency) -------------
 
 export const estimateTokens = (chars: number): number => Math.ceil(chars / 4);
 
-// ---- Main hot/cold split -----------------------------------------------------
-
-const TAG_RE_HISTORY = /\[(?:user|assistant|tool|system)\]/;
+// ---- Main hot/cold split ----------------------------------------------------
 
 export function compressHistory(history: Turn[], opts: CompressOptions): {
-  projected: Array<{ role: string; text: string; compressed?: boolean; ti?: number }>;
+  projected: ProjectedTurn[];
   stats: CompressStats;
 } {
-  const n = history.length;
+  const before = history.reduce((sum, turn) => sum + turn.text.length, 0);
   const minTurns = Math.max(2, opts.minTurnsBeforeCompression);
-  const hotStart = Math.max(0, n - opts.keepRecentTurns);
+  const hotStart = Math.max(0, history.length - opts.keepRecentTurns);
+  const beforeCost = history.reduce((sum, turn) => sum + messageCost(turn.text), 0);
+  const budgetChars = resolveBudgetChars(opts);
+  const hardLimit = budgetChars !== null && beforeCost > budgetChars;
+  const eligible: number[] = [];
 
-  const before = history.reduce((a, t) => a + t.text.length, 0);
-  const projected: Array<{ role: string; text: string; compressed?: boolean; ti?: number }> = [];
-  let anchorsKept = 0;
-  let turnsCompressed = 0;
-  let after = 0;
-
-  // Budget-mode tuning: how aggressively to squeeze the cold zone.
-  const coldOriginal = history.slice(0, hotStart).reduce((a, t) => a + t.text.length, 0);
-  const totalOriginal = before;
-  let ratio = opts.compressionRatio;
-  if (opts.targetTokenBudget > 0) {
-    const budgetChars = opts.targetTokenBudget * 4;
-    const hotChars = history.slice(hotStart).reduce((a, t) => a + t.text.length, 0);
-    const coldBudget = Math.max(200, budgetChars - hotChars);
-    ratio = Math.min(0.95, coldBudget / Math.max(1, coldOriginal));
-    if (totalOriginal - hotChars <= coldBudget) ratio = 1; // already fits
+  for (let index = 0; index < history.length; index++) {
+    const turn = history[index];
+    const compressible = turn.compressible ?? (turn.role === "user" || turn.role === "assistant");
+    if (
+      history.length >= minTurns &&
+      index < hotStart &&
+      compressible &&
+      turn.text.trim().length > 0 &&
+      turn.text.length >= Math.max(MIN_SOURCE_CHARS, opts.minMessageChars)
+    ) {
+      eligible.push(index);
+    }
   }
 
-  for (let i = 0; i < n; i++) {
-    const turn = history[i];
-    const msgActualChars = turn.text.length;
-    if (i >= hotStart || msgActualChars < opts.minMessageChars || n < minTurns || ratio >= 1) {
-      projected.push({ role: turn.role, text: turn.text, ti: i });
-      after += msgActualChars;
+  const eligibleSet = new Set(eligible);
+  const projected: ProjectedTurn[] = [];
+  let anchorsKept = 0;
+  let anchorsClipped = 0;
+  let turnsCompressed = 0;
+  let turnsDropped = 0;
+  let charsAfter = 0;
+
+  const fixedCost = history.reduce((sum, turn, index) => {
+    if (eligibleSet.has(index)) return sum;
+    return sum + messageCost(turn.text);
+  }, 0);
+
+  let allocations = new Map<number, number>();
+  if (eligible.length > 0) {
+    if (hardLimit && budgetChars !== null) {
+      let available = budgetChars - fixedCost;
+      while (eligible.length > 0 && available < minimumAllocation(eligible, history)) {
+        eligible.shift();
+      }
+      available = budgetChars - fixedCost;
+      if (available > 0 && eligible.length > 0) {
+        allocations = allocateHardBudget(eligible, history, available, opts.compressionRatio);
+      }
+    } else {
+      for (const index of eligible) {
+        const turn = history[index];
+        const tagLength = tagFor(index, turn.role).length;
+        const target = Math.max(tagLength + MIN_TEXT_CHARS, Math.round(turn.text.length * opts.compressionRatio));
+        allocations.set(index, Math.min(turn.text.length - 1, target));
+      }
+    }
+  }
+
+  for (let index = 0; index < history.length; index++) {
+    const turn = history[index];
+    const allocation = allocations.get(index);
+    if (allocation === undefined) {
+      if (eligibleSet.has(index)) {
+        turnsDropped++;
+        continue;
+      }
+      projected.push({ role: turn.role, text: turn.text, compressed: false, originalIndex: index, anchors: 0 });
+      charsAfter += turn.text.length;
       continue;
     }
-    const budget = Math.max(80, Math.round(msgActualChars * ratio));
-    const { compressed, anchors } = compressTurnText(turn.text, budget, opts.anchorPreserve);
-    anchorsKept += anchors;
+
+    const tag = tagFor(index, turn.role);
+    const textBudget = Math.max(1, allocation - tag.length);
+    const compressed = compressTurnText(turn.text, textBudget, opts.anchorPreserve);
+    const candidate = tag + compressed.compressed;
+    if (budgetChars === null && candidate.length >= turn.text.length) {
+      projected.push({ role: turn.role, text: turn.text, compressed: false, originalIndex: index, anchors: 0 });
+      charsAfter += turn.text.length;
+      continue;
+    }
+
+    anchorsKept += compressed.anchors;
+    anchorsClipped += compressed.anchorsClipped;
     turnsCompressed++;
-    const text = `[t${i + 1} ${turn.role}, compressed] ${compressed}`;
-    projected.push({ role: turn.role, text, compressed: true, ti: i });
-    after += text.length;
+    projected.push({
+      role: turn.role,
+      text: candidate,
+      compressed: true,
+      originalIndex: index,
+      anchors: compressed.anchors,
+    });
+    charsAfter += candidate.length;
   }
 
+  const projectedCost = projected.reduce((sum, turn) => sum + messageCost(turn.text), 0);
   const stats: CompressStats = {
-    turnsTotal: n,
+    turnsTotal: history.length,
     turnsCompressed,
+    turnsDropped,
     charsBefore: before,
-    charsAfter: after,
+    charsAfter,
     anchorsKept,
-    savingsPct: before > 0 ? Math.round((1 - after / before) * 100) : 0,
+    anchorsClipped,
+    savingsPct: before > 0 ? Math.round((1 - charsAfter / before) * 100) : 0,
+    budgetChars,
+    overBudget: budgetChars !== null && projectedCost > budgetChars,
   };
   return { projected, stats };
+}
+
+function resolveBudgetChars(opts: CompressOptions): number | null {
+  const configBudget = opts.targetTokenBudget > 0 ? opts.targetTokenBudget * 4 : Number.POSITIVE_INFINITY;
+  const hostBudget = (opts.hostTokenBudget ?? 0) > 0 ? (opts.hostTokenBudget as number) * 4 : Number.POSITIVE_INFINITY;
+  const charBudget = Math.min(configBudget, hostBudget);
+  return Number.isFinite(charBudget) ? Math.floor(charBudget) : null;
+}
+
+function allocateHardBudget(
+  eligible: number[],
+  history: Turn[],
+  available: number,
+  ratio: number
+): Map<number, number> {
+  const allocations = new Map<number, number>();
+  const totalLength = eligible.reduce((sum, index) => sum + history[index].text.length, 0);
+  let remaining = available;
+
+  for (let position = 0; position < eligible.length; position++) {
+    const index = eligible[position];
+    const turn = history[index];
+    const slotsLeft = eligible.length - position;
+    const minimum = tagFor(index, turn.role).length + MIN_TEXT_CHARS;
+    const weighted = totalLength > 0 ? Math.floor(available * (turn.text.length / totalLength)) : minimum;
+    const cap = remaining - (slotsLeft - 1) * minimum;
+    // The budget is a cap, not a spending target. Never allocate more than the
+    // configured ratio would have used just because the cap is larger.
+    const ratioTarget = Math.round(turn.text.length * ratio);
+    const allocation = Math.max(
+      minimum,
+      Math.min(weighted, cap, ratioTarget, Math.max(minimum, turn.text.length - 1))
+    );
+    allocations.set(index, allocation);
+    remaining -= allocation;
+  }
+  return allocations;
+}
+
+function minimumAllocation(eligible: number[], history: Turn[]): number {
+  return eligible.reduce(
+    (sum, index) => sum + tagFor(index, history[index].role).length + MIN_TEXT_CHARS,
+    0
+  );
+}
+
+function tagFor(index: number, role: TurnRole): string {
+  const safeRole = role === TAG_ROLE_FALLBACK ? TAG_ROLE_FALLBACK : role;
+  return `[t${index + 1} ${safeRole}, compressed] `;
+}
+
+function messageCost(text: string): number {
+  return text.length + MESSAGE_OVERHEAD_CHARS;
 }
